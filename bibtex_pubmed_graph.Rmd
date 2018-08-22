@@ -1,0 +1,197 @@
+---
+output:
+    pdf_document:
+        latex_engine: xelatex
+    html_document: default
+---
+
+
+```{r echo=FALSE, message=FALSE}
+
+# Helper functions
+
+source('./Rscripts/eutils.R')
+
+# Wrapper function combining results from different eutils requests
+# pmid: batched PMID (list of vectors)
+# path : where to save temp data
+request_databases <- function(pmid=pmid_batch, path="data", from=1, to=length(pmid)){
+
+    # Create folder where data will be saved
+    if (file.exists(path)==FALSE){
+        dir.create(path)
+    }
+    
+    max <- length(pmid)
+    for (i in from:min(max,to)){
+        reformated_data <- data.frame()
+
+        # Get pmid data
+        pmid_data <- eutils$fetch_PUBMED_info(pmid[[i]])
+
+        # Get citation data
+        citation_data <- eutils$fetch_PMC_citations(pmid[[i]])
+        
+        # Merge data
+        reformated_data <- merge(pmid_data, citation_data, by.x="pmid", by.y="cpmid")
+        
+        # Write data to a temp file
+        file <- paste(path, "/data_", paste0(pmid[[i]], collapse = "-"),".txt", sep="")
+        write.table(reformated_data, file=file, sep="\t", row.names = FALSE)
+    }
+}
+
+# Merge back saved tables
+merge_temp_data <- function(path="data"){
+    require(plyr)
+    data_files <- list.files(path, full.names=TRUE)
+    df <- ldply(data_files, function(x){
+        df1 <- read.csv(x, header=TRUE, sep="\t", stringsAsFactors = FALSE, encoding="UTF-8")
+        df2 <- data.frame(data_files=gsub(pattern=paste(path, "/", sep=""), replacement="",x), df1, stringsAsFactors = FALSE)
+        return(df2)
+    })
+    # Write full data
+    file <- paste("./full_dataset.txt", sep="")
+    write.table(df, file=file, sep="\t", row.names = FALSE)
+    return(df)
+}
+```
+
+
+# Load library
+
+Our first task is to load the bib file containing our references.
+
+
+```{r, message=FALSE}
+suppressPackageStartupMessages(library("RefManageR"))
+
+bib_data <- ReadBib("all_TCR_CD4_specific.bib")
+# names(bib_data)
+# length(bib_data)
+# fields(bib_data)
+
+```
+
+
+# Find entries without a PMID
+
+These entries can be manually checked in the reference manager.
+
+
+```{r, message=FALSE}
+names(bib_data[unlist(lapply(bib_data$pmid, is.null))])
+```
+
+# Retrieve number of citations from PUBMED and PMC
+
+
+```{r, message=FALSE}
+suppressPackageStartupMessages(library("RCurl"))
+suppressPackageStartupMessages(library("XML"))
+suppressPackageStartupMessages(library(httr))
+
+all_pmids <- unique( unlist(bib_data$pmid, use.names=FALSE) )
+
+# Sample data
+# pmid_batch <- eutils$split_into_batch(c(9989491), 1)
+# pmid_batch <- eutils$split_into_batch(all_pmids[1:5], 5)
+# pmid_batch <- eutils$split_into_batch(all_pmids[1:9], 3)
+# Real data
+pmid_batch <- eutils$split_into_batch(all_pmids, 15)
+
+# df <- get_pubmed(pmid_batch[[1]])
+# tmp <- fetch_PMC_citations(pmid_batch[[1]])
+#request_databases(pmid_batch)
+
+data <- merge_temp_data()
+
+# Update BibEntry objects
+for (entry in bib_data) {
+
+    if (is.null(entry$pmid)) { next }
+    
+    downloaded_data <- data[data$pmid==entry$pmid,]
+    
+    if (nrow(downloaded_data) == 0) { next }
+    else if (nrow(downloaded_data) > 1) { sprintf("Problem with %s", data$pmid) }
+    else {
+        bib_data[attr(entry, "key")]$referencesnb <- as.integer(downloaded_data$references)
+        bib_data[attr(entry, "key")]$citationsnb <- as.integer(downloaded_data$citationsnb)
+        bib_data[attr(entry, "key")]$citationspmid <- downloaded_data$citations
+    }
+
+}
+```
+
+
+
+# Which are the top cited articles in each k_* category?
+
+```{r, message=FALSE}
+all_keywords_unique <- unique(unlist(
+    lapply(bib_data$keywords, 
+           function(x) {
+               if(is.null(x)) { return(c("")) }
+               keywords <- unlist(strsplit(x, split = ",", fixed = TRUE))
+               return(unique(trimws(keywords)))
+           })
+))
+categories <- all_keywords_unique[grepl("^k[{]\\\\_[}]", all_keywords_unique)]
+
+for (category in categories) {
+    
+    is_in_category <- grepl(category, bib_data$keywords, fixed = TRUE)
+    has_citationsnb <- !unlist(lapply(bib_data$citationsnb, is.null), use.names = FALSE)
+    entries_in_category <- bib_data[is_in_category & has_citationsnb]
+    if(length(entries_in_category)>0) {
+        sorted <- entries_in_category[order(as.integer(entries_in_category$citationsnb), decreasing = TRUE, na.last = TRUE)]
+
+        print("")
+        print(category)
+        for (best in head(sorted, n = 7)) {
+            print(sprintf("%s %s %s %s %s", best$citationsnb, best$year, best$pmid, best$author[[1]]$family, best$title)) #attr(best, "key")
+        }
+    }
+
+}
+```
+
+
+# Which are the best suggested articles by PUBMED based on each k_* category?
+
+```{r message=FALSE}
+all_keywords_unique <- unique(unlist(
+    lapply(bib_data$keywords, 
+           function(x) {
+               if(is.null(x)) { return(c("")) }
+               keywords <- unlist(strsplit(x, split = ",", fixed = TRUE))
+               return(unique(trimws(keywords)))
+           })
+))
+categories <- all_keywords_unique[grepl("^k[{]\\\\_[}]", all_keywords_unique)]
+
+old.opt.val <- BibOptions(check.entries = FALSE)
+for (category in categories) {
+    
+    is_in_category <- grepl(category, bib_data$keywords, fixed = TRUE)
+    has_pmid <- !unlist(lapply(bib_data$pmid, is.null), use.names = FALSE)
+    entries_in_category <- bib_data[is_in_category & has_pmid]
+    if(length(entries_in_category)>0) {
+        requested_data <- GetPubMedRelated(unlist(entries_in_category$pmid, use.names = FALSE), database = "pubmed", batch.mode = TRUE, max.results = 30, return.related.ids = TRUE)
+        has_year <- !unlist(lapply(requested_data$year, is.null), use.names = FALSE)
+        data_w_pmid <- LookupPubMedID(requested_data[has_year])
+        data_w_citations <- eutils$fetch_PMC_citations(unlist(data_w_pmid$eprint, use.names = FALSE)) 
+        sorted <- data_w_pmid[order(as.integer(data_w_citations$citationsnb), decreasing = TRUE, na.last = TRUE)]
+        
+        print("")
+        print(category)
+        for (best in head(sorted, n = 7)) {
+            print(sprintf("%s %s %s %s %s", data_w_citations[data_w_citations$cpmid==best$eprint,]$citationsnb, best$year, best$eprint, best$author[[1]]$family, best$title)) #, attr(best, "key")
+        }
+    }
+    
+}
+old.opt.val <- BibOptions(check.entries = TRUE)
+```
+
